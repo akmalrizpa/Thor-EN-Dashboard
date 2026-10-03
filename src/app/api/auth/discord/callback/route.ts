@@ -7,8 +7,6 @@ import { cfg, isDiscordOAuthReady } from "@/lib/config";
 import { appOrigin } from "@/lib/origin";
 import { createSessionToken, sessionCookie } from "@/lib/session";
 
-// v3.28.3: every Discord.com fetch gets an 8s timeout — a hung connection
-// used to hang the OAuth callback indefinitely (browser spinner forever).
 const DISCORD_FETCH_TIMEOUT_MS = 8000;
 
 async function discordFetch(url: string, init: RequestInit = {}): Promise<Response> {
@@ -26,11 +24,10 @@ function redirectUri(req: Request): string {
 }
 
 function fail(req: Request, reason: string): Response {
-  // v3.28.3: always clear the one-shot state cookie on failure — it used to
-  // linger up to 600s after failed attempts.
-  const res = Response.redirect(new URL(`/?error=${reason}`, appOrigin(req)), 302);
-  res.headers.append("set-cookie", "thor_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-  return res;
+  const headers = new Headers();
+  headers.set("Location", `/?error=${reason}`);
+  headers.append("set-cookie", "thor_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+  return new Response(null, { status: 302, headers });
 }
 
 function readStateCookie(req: Request): string | null {
@@ -54,20 +51,12 @@ export async function GET(req: Request) {
     return fail(req, "login_dibatalkan");
   }
 
-  // Validate the CSRF state — v3.28.3: timing-safe comparison (same rigor
-  // as the session HMAC right next door).
   const expected = readStateCookie(req);
   if (!state || !expected || !timingSafeEqualHex(state, expected)) {
     return fail(req, "sesi_kedaluwarsa");
   }
 
-  // v3.28.3: the whole exchange → profile → upsert chain used to run WITHOUT
-  // a try/catch — a transient network error, a non-JSON error body or a DB
-  // failure (SQLite lock / read-only FS on Termux) produced a raw 500 page
-  // mid-login instead of the graceful /?error=... redirect every other
-  // failure path uses.
   try {
-    // Exchange code -> access token
     const tokenRes = await discordFetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -85,13 +74,12 @@ export async function GET(req: Request) {
     const token = (await tokenRes.json()) as {
       access_token?: string;
       refresh_token?: string;
-      expires_in?: number; // seconds
+      expires_in?: number;
     };
     if (!token.access_token) {
       return fail(req, "login_gagal");
     }
 
-    // Fetch the Discord profile
     const meRes = await discordFetch("https://discord.com/api/users/@me", {
       headers: { authorization: `Bearer ${token.access_token}` },
     });
@@ -105,11 +93,7 @@ export async function GET(req: Request) {
       avatar?: string;
     };
 
-    // The ADMIN_DISCORD_IDS list in env is the source of truth: re-login
-    // refreshes admin status (removed from env = demoted automatically at login)
     const isAdmin = cfg.adminDiscordIds.includes(profile.id);
-    // v2: store the user's OAuth token (identify+guilds scope) for the Server
-    // Picker page — the guild list is fetched live from Discord, never copied.
     const tokenExpiresAt = new Date(Date.now() + (token.expires_in ?? 604800) * 1000);
     const user = await db.user.upsert({
       where: { discordId: profile.id },
@@ -134,10 +118,6 @@ export async function GET(req: Request) {
       },
     });
 
-    // Profile-carrying token: the session stays valid across sandbox instances
-    // (see session.ts) — any instance can complete the callback.
-    // v3.24.1 SECURITY FIX (1.1): createSessionToken throws when SESSION_SECRET is
-    // empty while OAuth is ready — surface it as a clear redirect instead of a 500.
     let sessionToken: string;
     try {
       sessionToken = createSessionToken(user);
@@ -146,24 +126,24 @@ export async function GET(req: Request) {
       return fail(req, "konfigurasi_tidak_aman");
     }
     const cookie = sessionCookie(sessionToken);
-    const res = new Response(null, { status: 302, headers: { Location: "/" } });
-    res.headers.append(
+
+    const headers = new Headers();
+    headers.set("Location", "/");
+    headers.append(
       "set-cookie",
       `${cookie.name}=${cookie.value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${cookie.maxAge}${
         cookie.secure ? "; Secure" : ""
       }`
     );
-    // Clear the state cookie
-    res.headers.append("set-cookie", "thor_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-    return res;
+    headers.append("set-cookie", "thor_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+
+    return new Response(null, { status: 302, headers });
   } catch (err) {
     console.error("[oauth] callback failed:", err instanceof Error ? err.message : err);
     return fail(req, "login_gagal");
   }
 }
 
-// Constant-time hex comparison — both sides are random 32-char hex strings
-// from our own cookie/param, so lengths always match; guard anyway.
 function timingSafeEqualHex(a: string, b: string): boolean {
   const bufA = Buffer.from(a, "utf8");
   const bufB = Buffer.from(b, "utf8");
